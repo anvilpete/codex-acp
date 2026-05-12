@@ -2,9 +2,9 @@ use acp::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
     AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    InitializeRequest, InitializeResponse, IntoOption, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, Meta, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
@@ -32,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::thread::Thread;
@@ -58,6 +58,7 @@ pub struct CodexAgent {
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
 
+const CODEX_ACP_NAMESPACE: &str = "codex-acp";
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
@@ -133,8 +134,10 @@ impl CodexAgent {
                                 responder,
                                 cx: ConnectionTo<Client>| {
                         let agent = agent.clone();
+                        let auth_cx = cx.clone();
                         cx.spawn(async move {
-                            responder.respond_with_result(agent.authenticate(request).await)
+                            responder
+                                .respond_with_result(agent.authenticate(request, auth_cx).await)
                         })?;
                         Ok(())
                     }
@@ -234,7 +237,7 @@ impl CodexAgent {
                         let agent = agent.clone();
                         cx.spawn(async move {
                             if let Err(e) = agent.cancel(notification).await {
-                                tracing::error!("Error handling cancel: {:?}", e);
+                                error!("Error handling cancel: {:?}", e);
                             }
                             Ok(())
                         })?;
@@ -432,6 +435,9 @@ impl CodexAgent {
         } = request;
         debug!("Received initialize request with protocol version {protocol_version:?}",);
         let protocol_version = ProtocolVersion::V1;
+        let client_supports_device_code_auth =
+            CodexAcpCapabilities::from_meta(client_capabilities.meta.as_ref())
+                .is_some_and(|capabilities| capabilities.device_code_auth);
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
@@ -439,7 +445,8 @@ impl CodexAgent {
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
             .mcp_capabilities(McpCapabilities::new().http(true))
             .load_session(true)
-            .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()));
+            .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+            .meta(CodexAcpCapabilities::new().device_code_auth(true));
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
@@ -450,8 +457,7 @@ impl CodexAgent {
             CodexAuthMethod::CodexApiKey.into(),
             CodexAuthMethod::OpenAiApiKey.into(),
         ];
-        // Until codex device code auth works, we can't use this in remote ssh projects
-        if std::env::var("NO_BROWSER").is_ok() {
+        if std::env::var("NO_BROWSER").is_ok() && !client_supports_device_code_auth {
             auth_methods.remove(0);
         }
 
@@ -464,6 +470,7 @@ impl CodexAgent {
     async fn authenticate(
         &self,
         request: AuthenticateRequest,
+        cx: ConnectionTo<Client>,
     ) -> Result<AuthenticateResponse, Error> {
         let auth_method = CodexAuthMethod::try_from(request.method_id)?;
 
@@ -483,7 +490,6 @@ impl CodexAgent {
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
-                // Perform browser/device login via codex-rs, then report success/failure to the client.
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.to_path_buf(),
                     codex_login::auth::CLIENT_ID.to_string(),
@@ -491,13 +497,18 @@ impl CodexAgent {
                     self.config.cli_auth_credentials_store_mode,
                 );
 
-                let server =
-                    codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
+                if std::env::var("NO_BROWSER").is_ok() {
+                    return Self::device_code_auth(opts, self.auth_manager.clone(), cx).await;
+                } else {
+                    // Perform browser/device login via codex-rs, then report success/failure to the client.
+                    let server =
+                        codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
 
-                server
-                    .block_until_done()
-                    .await
-                    .map_err(Error::into_internal_error)?;
+                    server
+                        .block_until_done()
+                        .await
+                        .map_err(Error::into_internal_error)?;
+                }
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
@@ -526,6 +537,41 @@ impl CodexAgent {
         self.auth_manager.reload().await;
 
         Ok(AuthenticateResponse::new())
+    }
+
+    async fn device_code_auth(
+        opts: codex_login::ServerOptions,
+        auth_manager: Arc<AuthManager>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<AuthenticateResponse, Error> {
+        let device_code = codex_login::request_device_code(&opts)
+            .await
+            .map_err(Error::into_internal_error)?;
+
+        let url = device_code.verification_url.clone();
+        let user_code = device_code.user_code.clone();
+
+        // Complete device code auth in the background.
+        cx.spawn(async move {
+            if let Err(err) = codex_login::complete_device_code_login(opts, device_code).await {
+                error!("Device code auth failed: {err:?}");
+            } else {
+                auth_manager.reload().await;
+            }
+            Ok(())
+        })?;
+
+        let message = format!(
+            "Follow these steps to sign in with ChatGPT using device code authorization:\n\
+            \n1. Open this link in your browser and sign in to your account\n   {url}\n\
+            \n2. Enter this one-time code (expires in 15 minutes)\n   {user_code}\n\
+            \nDevice codes are a common phishing target. Never share this code.\n"
+        );
+        Err(Error::auth_required().data(DeviceCodeAuthRequiredData {
+            message,
+            url,
+            user_code,
+        }))
     }
 
     async fn logout(&self, _request: LogoutRequest) -> Result<LogoutResponse, Error> {
@@ -870,6 +916,52 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
             "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
             _ => Err(Error::invalid_params().data("unsupported authentication method")),
         }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceCodeAuthRequiredData {
+    message: String,
+    url: String,
+    user_code: String,
+}
+
+impl IntoOption<serde_json::Value> for DeviceCodeAuthRequiredData {
+    fn into_option(self) -> Option<serde_json::Value> {
+        Some(serde_json::to_value(self).expect("DeviceCodeAuthRequiredData should serialize"))
+    }
+}
+
+#[derive(Default, Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAcpCapabilities {
+    #[serde(default)]
+    device_code_auth: bool,
+}
+
+impl CodexAcpCapabilities {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn device_code_auth(mut self, device_code_auth: bool) -> Self {
+        self.device_code_auth = device_code_auth;
+        self
+    }
+
+    fn from_meta(meta: Option<&Meta>) -> Option<Self> {
+        meta.and_then(|meta| meta.get(CODEX_ACP_NAMESPACE))
+            .and_then(|value| serde_json::from_value::<Self>(value.clone()).ok())
+    }
+}
+
+impl IntoOption<Meta> for CodexAcpCapabilities {
+    fn into_option(self) -> Option<Meta> {
+        Some(serde_json::Map::from_iter([(
+            CODEX_ACP_NAMESPACE.to_string(),
+            serde_json::to_value(self).expect("CodexAcpCapabilities should serialize"),
+        )]))
     }
 }
 
