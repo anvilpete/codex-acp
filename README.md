@@ -20,7 +20,9 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
   - Custom Prompts
 - Client MCP servers
 - Auth Methods:
-  - ChatGPT subscription (requires paid subscription and doesn't work in remote projects)
+  - ChatGPT subscription
+    - Launches a browser if available
+    - Uses device code auth if NO_BROWSER is set
   - CODEX_API_KEY
   - OPENAI_API_KEY
 
