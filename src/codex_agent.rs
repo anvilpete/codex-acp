@@ -1,16 +1,18 @@
 use acp::schema::{
-    AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
-    AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    AgentAuthCapabilities, AgentCapabilities, AgentRequest, AuthEnvVar, AuthMethod,
+    AuthMethodAgent, AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
+    CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
+    CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
+    ElicitationRequestScope, ElicitationUrlMode, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities,
+    McpServer, McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, RequestId,
     SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
-use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
+use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, Responder};
 use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
@@ -32,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::thread::Thread;
@@ -130,11 +132,16 @@ impl CodexAgent {
                 {
                     let agent = agent.clone();
                     async move |request: AuthenticateRequest,
-                                responder,
+                                responder: Responder<AuthenticateResponse>,
                                 cx: ConnectionTo<Client>| {
                         let agent = agent.clone();
+                        let auth_cx = cx.clone();
+                        let request_id = request_id_from_json(responder.id())
+                            .expect("request id must be a string or number");
                         cx.spawn(async move {
-                            responder.respond_with_result(agent.authenticate(request).await)
+                            responder.respond_with_result(
+                                agent.authenticate(request, auth_cx, request_id).await,
+                            )
                         })?;
                         Ok(())
                     }
@@ -234,7 +241,7 @@ impl CodexAgent {
                         let agent = agent.clone();
                         cx.spawn(async move {
                             if let Err(e) = agent.cancel(notification).await {
-                                tracing::error!("Error handling cancel: {:?}", e);
+                                error!("Error handling cancel: {:?}", e);
                             }
                             Ok(())
                         })?;
@@ -433,6 +440,11 @@ impl CodexAgent {
         debug!("Received initialize request with protocol version {protocol_version:?}",);
         let protocol_version = ProtocolVersion::V1;
 
+        let client_supports_url_elicitation = client_capabilities
+            .elicitation
+            .as_ref()
+            .is_some_and(|elicitation| elicitation.url.is_some());
+
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
         let mut agent_capabilities = AgentCapabilities::new()
@@ -450,8 +462,8 @@ impl CodexAgent {
             CodexAuthMethod::CodexApiKey.into(),
             CodexAuthMethod::OpenAiApiKey.into(),
         ];
-        // Until codex device code auth works, we can't use this in remote ssh projects
-        if std::env::var("NO_BROWSER").is_ok() {
+
+        if std::env::var("NO_BROWSER").is_ok() && !client_supports_url_elicitation {
             auth_methods.remove(0);
         }
 
@@ -464,6 +476,8 @@ impl CodexAgent {
     async fn authenticate(
         &self,
         request: AuthenticateRequest,
+        cx: ConnectionTo<Client>,
+        request_id: RequestId,
     ) -> Result<AuthenticateResponse, Error> {
         let auth_method = CodexAuthMethod::try_from(request.method_id)?;
 
@@ -483,7 +497,6 @@ impl CodexAgent {
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
-                // Perform browser/device login via codex-rs, then report success/failure to the client.
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.to_path_buf(),
                     codex_login::auth::CLIENT_ID.to_string(),
@@ -491,13 +504,18 @@ impl CodexAgent {
                     self.config.cli_auth_credentials_store_mode,
                 );
 
-                let server =
-                    codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
+                if std::env::var("NO_BROWSER").is_ok() {
+                    Self::device_code_auth(opts, self.auth_manager.clone(), cx, request_id).await?;
+                } else {
+                    // Perform browser/device login via codex-rs, then report success/failure to the client.
+                    let server =
+                        codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
 
-                server
-                    .block_until_done()
-                    .await
-                    .map_err(Error::into_internal_error)?;
+                    server
+                        .block_until_done()
+                        .await
+                        .map_err(Error::into_internal_error)?;
+                }
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
@@ -526,6 +544,53 @@ impl CodexAgent {
         self.auth_manager.reload().await;
 
         Ok(AuthenticateResponse::new())
+    }
+
+    async fn device_code_auth(
+        opts: codex_login::ServerOptions,
+        auth_manager: Arc<AuthManager>,
+        cx: ConnectionTo<Client>,
+        request_id: RequestId,
+    ) -> Result<(), Error> {
+        let device_code = codex_login::request_device_code(&opts)
+            .await
+            .map_err(Error::into_internal_error)?;
+
+        let url = device_code.verification_url.clone();
+        let user_code = device_code.user_code.clone();
+        let message = format!(
+            "Follow these steps to sign in with ChatGPT using device code authorization:\n\
+            \n1. Open this link in your browser and sign in to your account\n   {url}\n\
+            \n2. Enter this one-time code (expires in 15 minutes)\n   {user_code}\n\
+            \nDevice codes are a common phishing target. Never share this code.\n"
+        );
+
+        let elicitation_id = format!("chatgpt-login-{}", uuid::Uuid::new_v4());
+        let response = cx
+            .send_request(AgentRequest::CreateElicitationRequest(
+                CreateElicitationRequest::new(
+                    ElicitationUrlMode::new(
+                        ElicitationRequestScope::new(request_id),
+                        elicitation_id,
+                        url.clone(),
+                    ),
+                    message.clone(),
+                ),
+            ))
+            .block_task()
+            .await?;
+
+        let response: CreateElicitationResponse =
+            serde_json::from_value(response).map_err(Error::into_internal_error)?;
+        if !matches!(response.action, ElicitationAction::Accept(_)) {
+            return Err(Error::auth_required());
+        }
+
+        codex_login::complete_device_code_login(opts, device_code)
+            .await
+            .map_err(Error::into_internal_error)?;
+        auth_manager.reload().await;
+        Ok(())
     }
 
     async fn logout(&self, _request: LogoutRequest) -> Result<LogoutResponse, Error> {
@@ -870,6 +935,14 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
             "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
             _ => Err(Error::invalid_params().data("unsupported authentication method")),
         }
+    }
+}
+
+fn request_id_from_json(id: serde_json::Value) -> Option<RequestId> {
+    match id {
+        serde_json::Value::String(id) => Some(id.into()),
+        serde_json::Value::Number(id) => id.as_i64().map(Into::into),
+        _ => None,
     }
 }
 
