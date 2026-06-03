@@ -10,7 +10,7 @@ use acp::schema::{
     PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, RequestId,
     SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    SetSessionModeResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, Responder};
 use agent_client_protocol as acp;
@@ -262,21 +262,6 @@ impl CodexAgent {
                         let agent = agent.clone();
                         cx.spawn(async move {
                             responder.respond_with_result(agent.set_session_mode(request).await)
-                        })?;
-                        Ok(())
-                    }
-                },
-                acp::on_receive_request!(),
-            )
-            .on_receive_request(
-                {
-                    let agent = agent.clone();
-                    async move |request: SetSessionModelRequest,
-                                responder,
-                                cx: ConnectionTo<Client>| {
-                        let agent = agent.clone();
-                        cx.spawn(async move {
-                            responder.respond_with_result(agent.set_session_model(request).await)
                         })?;
                         Ok(())
                     }
@@ -649,7 +634,6 @@ impl CodexAgent {
 
         Ok(NewSessionResponse::new(session_id)
             .modes(load.modes)
-            .models(load.models)
             .config_options(load.config_options))
     }
 
@@ -725,7 +709,6 @@ impl CodexAgent {
 
         Ok(LoadSessionResponse::new()
             .modes(load.modes)
-            .models(load.models)
             .config_options(load.config_options))
     }
 
@@ -840,19 +823,6 @@ impl CodexAgent {
             .set_mode(args.mode_id)
             .await?;
         Ok(SetSessionModeResponse::default())
-    }
-
-    async fn set_session_model(
-        &self,
-        args: SetSessionModelRequest,
-    ) -> Result<SetSessionModelResponse, Error> {
-        info!("Setting session model for session: {}", args.session_id);
-
-        self.get_thread(&args.session_id)?
-            .set_model(args.model_id)
-            .await?;
-
-        Ok(SetSessionModelResponse::default())
     }
 
     async fn set_session_config_option(
